@@ -1,0 +1,439 @@
+import subprocess, json, os, time, shlex, asyncio, random
+import discord
+from discord.ext import commands, tasks
+from groq import Groq
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+client = Groq(api_key=GROQ_API_KEY)
+
+MODEL = "llama-3.1-8b-instant"  # kuota harian gratis jauh lebih besar dari 70b
+MAX_TOOL_ROUNDS = 5  # dikurangi dari 7 supaya hemat token (hindari rate limit harian)
+
+SYSTEM_PROMPT = (
+    "Asisten riset Web3/crypto. Gunakan tools untuk gali data — jangan jawab "
+    "dari ingatan kalau ada tool yang relevan.\n\n"
+    "Untuk 'proyek baru' umum: panggil get_newest_airdrops + search_fundraising "
+    "(tanpa query) + get_token_of_the_day/get_trending_projects. Kalau ada nama "
+    "menonjol, lanjut search_social_posts(nama) & search_fund(nama).\n"
+    "Untuk proyek spesifik: search_project(nama) → search_fundraising(nama) → "
+    "search_airdrop(nama) → search_social_posts(nama).\n"
+    "Boleh panggil beberapa tool sekaligus.\n\n"
+    "ATURAN:\n"
+    "1. HANYA fakta dari hasil tool, JANGAN mengarang. Kalau kosong, bilang "
+    "'tidak tersedia'.\n"
+    "2. Postingan sosial diberi label '(klaim sosial, belum terverifikasi)'.\n"
+    "3. Pilih maksimal 3-5 item PALING relevan, bahas detail — jangan dump "
+    "semua data mentah.\n"
+    "4. Bulatkan desimal ke 1 angka. Buang field kosong/null.\n"
+    "5. WAJIB sertakan status sumber untuk SETIAP item yang dibahas — kalau ada "
+    "link/url/source_url, tampilkan (format: nama — link). Kalau TIDAK ada, "
+    "tulis eksplisit 'sumber/link tidak tersedia' — JANGAN diam-diam skip info "
+    "sumber begitu saja, dan JANGAN PERNAH mengarang URL yang tidak ada di data.\n"
+    "6. DILARANG pakai template penutup generik ('cari info lebih lanjut', "
+    "'evaluasi risiko investasi', dst). Ganti dengan SATU insight spesifik "
+    "yang beda tiap kali, sesuai item yang dibahas.\n"
+    "7. Akhiri HANYA dengan tag singkat '(snapshot, bukan saran finansial)' — "
+    "tanpa paragraf tambahan.\n"
+    "8. DILARANG bikin 'skor potensial' atau rating angka presisi (contoh: "
+    "'9/10', '8.5/10') — itu opini dibungkus angka, terkesan objektif "
+    "padahal tidak. Kalau mau kasih penilaian kualitatif, pakai kata biasa "
+    "('traksi sosial naik', 'baru tahap seed') — bukan skor angka.\n\n"
+    "FORMAT CARD untuk pembahasan 1 proyek spesifik (pakai bold per label, "
+    "baris baru per field, SKIP field yang datanya kosong — jangan tulis "
+    "'tidak tersedia' berulang untuk tiap field kosong):\n"
+    "**Nama Proyek**\n"
+    "Deskripsi singkat.\n"
+    "Kategori: ...\n"
+    "Tahap: ... | Dana terkumpul: ...\n"
+    "Status Airdrop: ...\n"
+    "Traksi Sosial: ... (klaim sosial, belum terverifikasi)\n"
+    "Sumber: ...\n\n"
+    "Jawab ringkas, padat, Bahasa Indonesia, enak dibaca di chat."
+)
+
+# ---------- Cache sederhana ----------
+_cache = {}
+CACHE_TTL = 60
+
+
+def surf_run(cmd: str):
+    now = time.time()
+    if cmd in _cache and now - _cache[cmd]["time"] < CACHE_TTL:
+        return _cache[cmd]["data"]
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        data = json.loads(r.stdout) if r.stdout else {"error": r.stderr[:300]}
+    except Exception as e:
+        data = {"error": str(e)}
+    _cache[cmd] = {"data": data, "time": now}
+    return data
+
+
+def _fmt_ts(unix_ts):
+    try:
+        if not unix_ts:
+            return None
+        return time.strftime("%Y-%m-%d", time.gmtime(int(unix_ts)))
+    except Exception:
+        return None
+
+
+def _q(text: str) -> str:
+    """Escape string untuk dipakai aman di shell command."""
+    return shlex.quote(text)
+
+
+# ---------- Extractors (rapikan hasil mentah Surf) ----------
+
+def extract_fundraising(raw):
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    result = []
+    for item in items[:6]:
+        title = item.get("title")
+        if not title:
+            continue
+        result.append({
+            "title": title,
+            "summary": item.get("summary"),
+            "importance": item.get("importance"),
+            "event_date": _fmt_ts(item.get("event_at")),
+            "source": (item.get("source") or {}).get("name"),
+            "source_url": (item.get("source") or {}).get("url"),
+        })
+    return result
+
+
+def extract_airdrop(raw):
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    result = []
+    for item in items[:20]:
+        name = item.get("project_name")
+        if not name:
+            continue
+        task_summary = item.get("task_summary") or {}
+        tasks = item.get("tasks") or []
+        # Ambil link partisipasi dari task pertama yang statusnya OPEN
+        link = None
+        for t in tasks:
+            if t.get("status") == "OPEN" and t.get("external_link"):
+                link = t.get("external_link")
+                break
+        entry = {
+            "project_name": name,
+            "coin_symbol": item.get("coin_symbol"),
+            "status": item.get("status"),
+            "reward_type": item.get("reward_type"),
+            "reward_date": _fmt_ts(item.get("reward_date")),
+            "total_raise_usd": item.get("total_raise") or None,
+            "xscore": item.get("xscore") or None,
+            "open_tasks": task_summary.get("open"),
+            "total_tasks": task_summary.get("total"),
+            "logo_url": item.get("logo_url") or None,
+        }
+        if link:
+            entry["link"] = link
+        result.append(entry)
+    return result
+
+
+def extract_social_people(raw, limit=3):
+    """Sesuai skema asli surf search-social-people. TIDAK ada field verifikasi
+    resmi — hasil ini cuma 'kemungkinan akun terkait', bukan konfirmasi tim."""
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    result = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        handle = item.get("handle")
+        if not handle:
+            continue
+        result.append({
+            "handle": handle,
+            "name": item.get("name"),
+            "bio": item.get("bio"),
+            "followers_count": item.get("followers_count"),
+        })
+    return result
+
+
+def extract_social_posts(raw, limit=6):
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    result = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not text:
+            continue
+        author = item.get("author") or {}
+        stats = item.get("stats") or {}
+        result.append({
+            "author_handle": author.get("handle"),
+            "text": text[:280],
+            "posted_at": _fmt_ts(item.get("created_at")),
+            "likes": stats.get("likes"),
+            "views": stats.get("views"),
+            "url": item.get("url"),
+        })
+    return result
+
+
+def extract_signal_tokens(raw, limit=6):
+    """Sesuai skema asli surf signal-token-of-the-day / signal-token-of-week."""
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    result = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not name:
+            continue
+        price_chg = item.get("price_change_percent") or {}
+        core_state = item.get("core_state") or {}
+        ai_summary = item.get("ai_summary") or {}
+        # ai_summary formatnya {<any>: string} — ambil value pertama yang ada
+        summary_text = next(iter(ai_summary.values()), None) if ai_summary else None
+
+        entry = {
+            "name": name,
+            "symbol": item.get("symbol"),
+            "rank": item.get("rank"),
+            "price_usd": item.get("price"),
+            "change_24h_percent": round(price_chg.get("24h"), 1) if isinstance(price_chg.get("24h"), (int, float)) else None,
+            "change_7d_percent": round(price_chg.get("7d"), 1) if isinstance(price_chg.get("7d"), (int, float)) else None,
+            "heat_score": round(item.get("heat_score"), 1) if isinstance(item.get("heat_score"), (int, float)) else None,
+            "state": core_state.get("state"),
+            "state_reason": core_state.get("reason"),
+            "ai_summary": summary_text,
+        }
+        # Buang key yang value-nya None biar tidak berisik
+        entry = {k: v for k, v in entry.items() if v is not None}
+        result.append(entry)
+    return result
+
+
+def extract_project_search(raw, limit=6):
+    """Sesuai skema asli surf search-project — TIDAK ada field website resmi."""
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    result = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not name:
+            continue
+        entry = {
+            "name": name,
+            "symbol": item.get("symbol"),
+            "description": item.get("description"),
+            "chains": item.get("chains") or None,
+            "tags": item.get("tags") or None,
+        }
+        entry = {k: v for k, v in entry.items() if v}
+        result.append(entry)
+    return result
+
+
+def simplify(data, limit=6):
+    if isinstance(data, list):
+        data = data[:limit]
+        simplified = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            project = item.get("project", {}) if isinstance(item.get("project"), dict) else {}
+            name = item.get("name") or project.get("name")
+            if not name:
+                continue
+            raw_value = item.get("value") or item.get("score") or item.get("mindshare")
+            entry = {
+                "name": name,
+                "symbol": item.get("symbol") or project.get("symbol"),
+                "score": round(raw_value, 1) if isinstance(raw_value, (int, float)) else raw_value,
+            }
+            for key in ["category", "chain", "market_cap", "launch_date", "status"]:
+                val = item.get(key) or project.get(key)
+                if val:
+                    entry[key] = val
+            simplified.append(entry)
+        return simplified
+    return data
+
+
+# ---------- TOOL DEFINITIONS (yang AI boleh panggil) ----------
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_fundraising",
+            "description": (
+                "Cari berita/event fundraising dan token-sale proyek crypto. "
+                "CATATAN: hasil tidak menyertakan nama proyek eksplisit, hanya "
+                "judul/ringkasan berita dan sumber. PENTING: kalau tidak ada "
+                "kata kunci spesifik dari user, JANGAN sertakan parameter "
+                "'query' sama sekali (bukan isi string kosong) — panggil tanpa "
+                "argumen untuk dapat timeline terbaru."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Kata kunci pencarian. Hilangkan parameter ini sepenuhnya jika tidak ada kata kunci spesifik."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_airdrop",
+            "description": (
+                "Cari airdrop crypto yang sedang aktif/bisa diklaim, dengan nama "
+                "proyek, status, dan total dana yang terkumpul. PENTING: kalau "
+                "user tidak sebut nama proyek/koin spesifik, JANGAN sertakan "
+                "parameter 'query' sama sekali (bukan isi string kosong)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nama/keyword koin untuk difilter. Hilangkan parameter ini sepenuhnya jika tidak ada nama spesifik."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_social_posts",
+            "description": "Cari postingan X/Twitter berdasarkan keyword. Berguna untuk cek sentimen/opini komunitas soal proyek tertentu.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword pencarian, bisa nama proyek atau topik. WAJIB diisi."},
+                    "min_faves": {"type": "integer", "description": "Minimal jumlah likes, default 20, gunakan angka lebih tinggi untuk hasil lebih kredibel."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_social_people",
+            "description": (
+                "Cari akun X/Twitter berdasarkan nama/keyword — bisa dipakai "
+                "untuk cari kemungkinan akun developer/tim/founder proyek. "
+                "PENTING: hasil ini TIDAK terverifikasi sebagai akun resmi tim "
+                "— cuma pencarian nama/bio yang cocok. Selalu sampaikan sebagai "
+                "'kemungkinan akun terkait, belum terverifikasi', jangan klaim "
+                "sebagai akun developer/tim resmi."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nama orang/proyek atau @handle yang dicari. WAJIB diisi."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trending_projects",
+            "description": "Ambil daftar proyek crypto yang sedang tren/naik daun berdasarkan sinyal Surf.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_social_ranking",
+            "description": "Ambil ranking token/proyek berdasarkan mindshare & aktivitas sosial.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_news",
+            "description": "Cari artikel berita crypto/Web3 terbaru berdasarkan keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Kata kunci berita yang dicari."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_project",
+            "description": (
+                "Cari detail dasar proyek crypto (nama, deskripsi, chain, tags). "
+                "CATATAN PENTING: tool ini TIDAK menyediakan link website resmi "
+                "proyek — hanya logo, deskripsi singkat, dan chain yang dipakai. "
+                "Untuk dapat LINK/URL, gunakan search_fundraising, search_news, "
+                "atau search_social_posts sebagai tambahan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nama atau simbol proyek yang dicari."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_newest_airdrops",
+            "description": (
+                "Ambil airdrop yang PALING BARU diumumkan (status POTENTIAL atau "
+                "CONFIRMED, artinya baru terdeteksi/baru dibuka, belum snapshot). "
+                "Gunakan ini kalau user tanya spesifik soal airdrop yang BARU "
+                "muncul, bukan yang sudah lama aktif."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_token_of_the_day",
+            "description": "Ambil token/proyek unggulan berdasarkan sinyal hari ini dari Surf.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_token_of_the_week",
+            "description": "Ambil token/proyek unggulan berdasarkan sinyal minggu ini dari Surf — untuk tren yang lebih stabil dibanding harian.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_fund",
+            "description": (
+                "Cari VC fund/investor crypto dan portofolio investasinya. "
+                "Berguna untuk cek fund apa yang baru saja berinvestasi di "
+                "proyek tertentu — sinyal kredibilitas untuk proyek baru."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Nama fund/VC atau nama proyek untuk dicari kaitannya."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
