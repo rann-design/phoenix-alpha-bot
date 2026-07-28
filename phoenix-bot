@@ -5,7 +5,6 @@ from groq import Groq
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-
 client = Groq(api_key=GROQ_API_KEY)
 
 MODEL = "llama-3.1-8b-instant"  # kuota harian gratis jauh lebih besar dari 70b
@@ -57,7 +56,6 @@ SYSTEM_PROMPT = (
 _cache = {}
 CACHE_TTL = 60
 
-
 def surf_run(cmd: str):
     now = time.time()
     if cmd in _cache and now - _cache[cmd]["time"] < CACHE_TTL:
@@ -70,7 +68,6 @@ def surf_run(cmd: str):
     _cache[cmd] = {"data": data, "time": now}
     return data
 
-
 def _fmt_ts(unix_ts):
     try:
         if not unix_ts:
@@ -79,14 +76,11 @@ def _fmt_ts(unix_ts):
     except Exception:
         return None
 
-
 def _q(text: str) -> str:
     """Escape string untuk dipakai aman di shell command."""
     return shlex.quote(text)
 
-
 # ---------- Extractors (rapikan hasil mentah Surf) ----------
-
 def extract_fundraising(raw):
     items = raw.get("data", []) if isinstance(raw, dict) else []
     result = []
@@ -104,7 +98,6 @@ def extract_fundraising(raw):
         })
     return result
 
-
 def extract_airdrop(raw):
     items = raw.get("data", []) if isinstance(raw, dict) else []
     result = []
@@ -114,7 +107,6 @@ def extract_airdrop(raw):
             continue
         task_summary = item.get("task_summary") or {}
         tasks = item.get("tasks") or []
-        # Ambil link partisipasi dari task pertama yang statusnya OPEN
         link = None
         for t in tasks:
             if t.get("status") == "OPEN" and t.get("external_link"):
@@ -137,10 +129,7 @@ def extract_airdrop(raw):
         result.append(entry)
     return result
 
-
 def extract_social_people(raw, limit=3):
-    """Sesuai skema asli surf search-social-people. TIDAK ada field verifikasi
-    resmi — hasil ini cuma 'kemungkinan akun terkait', bukan konfirmasi tim."""
     items = raw.get("data", []) if isinstance(raw, dict) else []
     result = []
     for item in items[:limit]:
@@ -156,7 +145,6 @@ def extract_social_people(raw, limit=3):
             "followers_count": item.get("followers_count"),
         })
     return result
-
 
 def extract_social_posts(raw, limit=6):
     items = raw.get("data", []) if isinstance(raw, dict) else []
@@ -179,9 +167,7 @@ def extract_social_posts(raw, limit=6):
         })
     return result
 
-
 def extract_signal_tokens(raw, limit=6):
-    """Sesuai skema asli surf signal-token-of-the-day / signal-token-of-week."""
     items = raw.get("data", []) if isinstance(raw, dict) else []
     result = []
     for item in items[:limit]:
@@ -193,9 +179,7 @@ def extract_signal_tokens(raw, limit=6):
         price_chg = item.get("price_change_percent") or {}
         core_state = item.get("core_state") or {}
         ai_summary = item.get("ai_summary") or {}
-        # ai_summary formatnya {<any>: string} — ambil value pertama yang ada
         summary_text = next(iter(ai_summary.values()), None) if ai_summary else None
-
         entry = {
             "name": name,
             "symbol": item.get("symbol"),
@@ -208,14 +192,11 @@ def extract_signal_tokens(raw, limit=6):
             "state_reason": core_state.get("reason"),
             "ai_summary": summary_text,
         }
-        # Buang key yang value-nya None biar tidak berisik
         entry = {k: v for k, v in entry.items() if v is not None}
         result.append(entry)
     return result
 
-
 def extract_project_search(raw, limit=6):
-    """Sesuai skema asli surf search-project — TIDAK ada field website resmi."""
     items = raw.get("data", []) if isinstance(raw, dict) else []
     result = []
     for item in items[:limit]:
@@ -234,7 +215,6 @@ def extract_project_search(raw, limit=6):
         entry = {k: v for k, v in entry.items() if v}
         result.append(entry)
     return result
-
 
 def simplify(data, limit=6):
     if isinstance(data, list):
@@ -261,9 +241,7 @@ def simplify(data, limit=6):
         return simplified
     return data
 
-
 # ---------- TOOL DEFINITIONS (yang AI boleh panggil) ----------
-
 TOOLS = [
     {
         "type": "function",
@@ -438,7 +416,6 @@ TOOLS = [
     },
 ]
 
-
 def execute_tool(name: str, args: dict):
     """Jalankan command Surf sesuai tool yang dipanggil AI."""
     query = (args or {}).get("query", "").strip()
@@ -487,7 +464,6 @@ def execute_tool(name: str, args: dict):
         return extract_project_search(surf_run(cmd))
 
     if name == "get_newest_airdrops":
-        # phase=active saja (POTENTIAL+CONFIRMED) = baru diumumkan, belum snapshot
         cmd = "surf search-airdrop --limit 20 --phase active --sort-by last_status_update --order desc --include-tasks -o json"
         return extract_airdrop(surf_run(cmd))
 
@@ -505,22 +481,17 @@ def execute_tool(name: str, args: dict):
 
     return {"error": f"tool '{name}' tidak dikenal"}
 
-
-# Kata kunci yang mengindikasikan pertanyaan BUTUH pencarian data
 _RESEARCH_KEYWORDS = [
     "proyek", "project", "airdrop", "early", "baru", "gem", "potential",
     "potensial", "fundraising", "pendanaan", "trending", "tren", "sinyal",
     "signal", "token", "cari", "gali", "cek", "rekomendasi",
 ]
 
-
 def _needs_research(msg: str) -> bool:
     msg = msg.lower()
     return any(kw in msg for kw in _RESEARCH_KEYWORDS)
 
-
 # ---------- Agent loop ----------
-
 async def run_agent(user_msg: str) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -530,7 +501,6 @@ async def run_agent(user_msg: str) -> str:
 
     for round_num in range(MAX_TOOL_ROUNDS):
         choice = "required" if (round_num == 0 and force_tool_first_round) else "auto"
-
         try:
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -544,7 +514,6 @@ async def run_agent(user_msg: str) -> str:
         except Exception as e:
             err_text = str(e)
             print("Groq API error:", err_text)
-
             if "tool_use_failed" in err_text or "Failed to call a function" in err_text:
                 print("Fallback: retry tanpa tool calling...")
                 try:
@@ -567,11 +536,9 @@ async def run_agent(user_msg: str) -> str:
                     return fallback.choices[0].message.content or "Maaf, pencarian sedang bermasalah."
                 except Exception as e2:
                     return f"Maaf, pencarian sedang bermasalah dan fallback juga gagal: {e2}"
-
             return f"Maaf, terjadi error saat menghubungi AI: {err_text[:300]}"
 
         msg = response.choices[0].message
-
         if not msg.tool_calls:
             return msg.content or "Maaf, tidak ada jawaban."
 
@@ -606,33 +573,30 @@ async def run_agent(user_msg: str) -> str:
 
     return "Maaf, pencarian terlalu kompleks dan belum selesai. Coba pertanyaan yang lebih spesifik."
 
-
 # ---------- Layer Discord ----------
-
 intents = discord.Intents.default()
 intents.message_content = True  # WAJIB diaktifkan juga di Discord Developer Portal
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DISCORD_LIMIT = 1900  # Discord max 2000 char/pesan, kasih margin aman
-
 
 async def send_long_message(channel, text: str):
     for i in range(0, len(text), DISCORD_LIMIT):
         await channel.send(text[i:i + DISCORD_LIMIT])
 
-
 @bot.event
 async def on_ready():
     print(f"Login sebagai {bot.user} — bot Discord aktif")
     try:
+        # Hapus command lama yang mungkin masih ke-cache di Discord (mis. /alpha
+        # yang sudah dihapus dari kode ini), lalu sync ulang tree yang aktif.
+        bot.tree.clear_commands(guild=None)
         synced = await bot.tree.sync()
         print(f"Slash command ter-sync: {len(synced)}")
     except Exception as e:
         print("Gagal sync slash command:", e)
     if not auto_update_loop.is_running():
         auto_update_loop.start()
-
 
 @bot.command(name="start")
 async def cmd_start(ctx):
@@ -646,7 +610,6 @@ async def cmd_start(ctx):
         f"tanpa perlu ketik apa-apa lagi.\n\nKetik `!stop` untuk berhenti."
     )
 
-
 @bot.command(name="stop")
 async def cmd_stop(ctx):
     subs = load_subscribers()
@@ -654,9 +617,7 @@ async def cmd_stop(ctx):
     save_subscribers(subs)
     await ctx.send("Update otomatis dihentikan. Ketik `!start` kapan saja buat aktifkan lagi.")
 
-
 # ---------- Slash command (/) — alternatif dari command "!" ----------
-
 @bot.tree.command(name="start", description="Aktifkan update otomatis di channel ini")
 async def slash_start(interaction: discord.Interaction):
     subs = load_subscribers()
@@ -669,7 +630,6 @@ async def slash_start(interaction: discord.Interaction):
         f"Ketik `/stop` untuk berhenti."
     )
 
-
 @bot.tree.command(name="stop", description="Matikan update otomatis di channel ini")
 async def slash_stop(interaction: discord.Interaction):
     subs = load_subscribers()
@@ -677,28 +637,13 @@ async def slash_stop(interaction: discord.Interaction):
     save_subscribers(subs)
     await interaction.response.send_message("Update otomatis dihentikan. Ketik `/start` kapan saja buat aktifkan lagi.")
 
-
-@bot.tree.command(name="alpha", description="Cari airdrop crypto terbaru")
-async def slash_alpha(interaction: discord.Interaction):
-    await interaction.response.send_message("🔍 Mencari airdrop terbaru...")
-    try:
-        items = await asyncio.to_thread(execute_tool, "get_newest_airdrops", {})
-    except Exception as e:
-        await interaction.followup.send(f"Gagal ambil data: {e}")
-        return
-
-    if not items or (isinstance(items, dict) and items.get("error")):
-        await interaction.followup.send("Tidak ada airdrop baru ditemukan saat ini.")
-        return
-
-    view = AlphaView(items)
-    await interaction.followup.send(embed=view.build_embed(), view=view)
-
+# NOTE: command "/alpha" dan "!alpha" sengaja DIHAPUS dari file ini.
+# Class AlphaView tetap dipertahankan karena masih dipakai oleh shortcut
+# emoji (🔍 dan 🛰️) di bawah dan oleh auto_update_loop.
 
 class AlphaView(discord.ui.View):
     """Card interaktif untuk browsing airdrop terbaru, satu per satu."""
 
-    # Warna & label badge sesuai lifecycle status airdrop (data asli dari Surf)
     STATUS_STYLE = {
         "POTENTIAL": (discord.Color.blue(), "🆕 BARU TERDETEKSI"),
         "CONFIRMED": (discord.Color.green(), "✅ DIKONFIRMASI"),
@@ -709,7 +654,7 @@ class AlphaView(discord.ui.View):
     }
 
     def __init__(self, items):
-        super().__init__(timeout=300)  # tombol nonaktif otomatis setelah 5 menit
+        super().__init__(timeout=300)
         self.items = items
         self.index = 0
 
@@ -717,7 +662,6 @@ class AlphaView(discord.ui.View):
         item = self.items[self.index]
         status = item.get("status", "")
         color, badge = self.STATUS_STYLE.get(status, (discord.Color.default(), None))
-
         title = item.get("project_name", "Unknown")
         symbol = item.get("coin_symbol")
         if symbol:
@@ -728,18 +672,15 @@ class AlphaView(discord.ui.View):
             description=f"**{badge}**" if badge else None,
             color=color,
         )
-
         if item.get("logo_url"):
             embed.set_thumbnail(url=item["logo_url"])
 
-        # Baris 1: Reward & tanggal
         if item.get("reward_type"):
             embed.add_field(name="🎁 Reward", value=item["reward_type"], inline=True)
         if item.get("reward_date"):
             embed.add_field(name="📅 Tanggal", value=item["reward_date"], inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True)  # spacer biar rapi 3 kolom
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        # Baris 2: Dana & skor sosial
         if item.get("total_raise_usd"):
             embed.add_field(name="💰 Dana Terkumpul", value=f"${item['total_raise_usd']:,}", inline=True)
         if item.get("xscore"):
@@ -751,8 +692,6 @@ class AlphaView(discord.ui.View):
                 inline=True,
             )
 
-        # Sumber/link resmi — SELALU ditampilkan eksplisit, jujur kalau tidak ada
-        # (bukan disembunyikan), supaya user tahu apa yang bisa diverifikasi sendiri
         if item.get("link"):
             embed.add_field(
                 name="🔗 Sumber / Link Resmi (verifikasi sendiri di sini)",
@@ -779,14 +718,9 @@ class AlphaView(discord.ui.View):
 
     @discord.ui.button(label="ℹ️ Detail Lengkap", style=discord.ButtonStyle.primary)
     async def detail_lengkap(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()  # kasih waktu, panggilan ini butuh 2 request tambahan
-
+        await interaction.response.defer()
         item = self.items[self.index]
         name = item.get("project_name", "")
-
-        # Lazy-load: cuma cari sekarang, buat item yang lagi ditampilkan aja.
-        # Pakai asyncio.to_thread supaya subprocess Surf CLI tidak nge-block
-        # event loop bot (yang bikin koneksi Discord putus & interaksi gagal)
         try:
             project_info = await asyncio.to_thread(execute_tool, "search_project", {"query": name})
         except Exception:
@@ -796,8 +730,7 @@ class AlphaView(discord.ui.View):
         except Exception:
             people_info = []
 
-        embed = self.build_embed()  # mulai dari card dasar yang sudah ada
-
+        embed = self.build_embed()
         if isinstance(project_info, list) and project_info:
             desc = project_info[0].get("description")
             if desc:
@@ -805,7 +738,6 @@ class AlphaView(discord.ui.View):
             chains = project_info[0].get("chains")
             if chains:
                 embed.add_field(name="⛓️ Chain", value=", ".join(chains), inline=False)
-
         if isinstance(people_info, list) and people_info:
             lines = []
             for p in people_info[:3]:
@@ -817,42 +749,20 @@ class AlphaView(discord.ui.View):
                 value="\n".join(lines),
                 inline=False,
             )
-
         if not (project_info or people_info):
             embed.add_field(name="ℹ️ Detail Tambahan", value="Tidak ditemukan info tambahan.", inline=False)
 
         await interaction.edit_original_response(embed=embed, view=self)
 
-
-@bot.command(name="alpha")
-async def cmd_alpha(ctx):
-    await ctx.send("🔍 Mencari airdrop terbaru...")
-    try:
-        items = await asyncio.to_thread(execute_tool, "get_newest_airdrops", {})
-    except Exception as e:
-        await ctx.send(f"Gagal ambil data: {e}")
-        return
-
-    if not items or (isinstance(items, dict) and items.get("error")):
-        await ctx.send("Tidak ada airdrop baru ditemukan saat ini.")
-        return
-
-    view = AlphaView(items)
-    await ctx.send(embed=view.build_embed(), view=view)
-
-
 # ---------- Shortcut emoji (kirim emoji ini SAJA sebagai pesan) ----------
-# Kirim salah satu emoji ini tanpa teks lain → bot otomatis jalankan tool terkait
 EMOJI_SHORTCUTS = {
-    "🔍": "get_newest_airdrops",       # airdrop baru
-    "🛰️": "get_newest_airdrops",       # alias lain buat airdrop baru
-    "📈": "get_trending_projects",      # proyek trending
-    "💰": "search_fundraising",         # berita fundraising terbaru
+    "🔍": "get_newest_airdrops",
+    "🛰️": "get_newest_airdrops",
+    "📈": "get_trending_projects",
+    "💰": "search_fundraising",
 }
 
-
 async def handle_emoji_shortcut(message, emoji: str):
-    """Jalankan tool yang sesuai emoji, tampilkan sebagai Embed kalau memungkinkan."""
     tool_name = EMOJI_SHORTCUTS.get(emoji)
     if not tool_name:
         return False
@@ -868,12 +778,10 @@ async def handle_emoji_shortcut(message, emoji: str):
         await message.channel.send("Tidak ada data ditemukan saat ini.")
         return True
 
-    # Kalau hasilnya list airdrop, pakai card interaktif yang sudah ada
     if tool_name == "get_newest_airdrops" and isinstance(result, list):
         view = AlphaView(result)
         await message.channel.send(embed=view.build_embed(), view=view)
     else:
-        # Untuk tool lain, tampilkan ringkas sebagai teks biasa
         lines = []
         for item in result[:5] if isinstance(result, list) else []:
             name = item.get("name") or item.get("title") or "Unknown"
@@ -884,23 +792,21 @@ async def handle_emoji_shortcut(message, emoji: str):
 
     return True
 
-
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Cek dulu apakah pesan cuma berisi emoji shortcut (tanpa teks lain)
     stripped = message.content.strip()
     if stripped in EMOJI_SHORTCUTS:
         handled = await handle_emoji_shortcut(message, stripped)
         if handled:
             return
 
-    # Biarkan command !start / !stop / !alpha diproses dulu
     await bot.process_commands(message)
+
     if message.content.startswith(bot.command_prefix):
-        return  # sudah ditangani sebagai command, jangan diproses AI lagi
+        return
 
     print("Pesan diterima:", message.content)
     try:
@@ -910,15 +816,10 @@ async def on_message(message):
         print("ERROR:", e)
         await message.channel.send(f"Terjadi error: {e}")
 
-
 # ---------- Auto-update terjadwal ----------
-
 SUBSCRIBERS_FILE = "subscribers_discord.json"
 AUTO_UPDATE_INTERVAL_MINUTES = 1
 
-# Cuma 2 kategori ini yang datanya benar-benar didukung Surf API dengan filter
-# yang jelas (task-type). Kategori lain (misal "DeFi") sengaja tidak dipaksakan
-# karena Surf tidak punya flag filter kategori proyek yang pasti untuk itu.
 CATEGORY_INFO = {
     "airdrop": {
         "cmd": "surf search-airdrop --limit 20 --phase active,claimable --include-tasks -o json",
@@ -943,28 +844,24 @@ CATEGORY_INFO = {
     },
 }
 
-
 def load_subscribers() -> set:
     try:
         with open(SUBSCRIBERS_FILE, "r") as f:
-     return set(json.load(f))
+            return set(json.load(f))
     except Exception:
         return set()
-
 
 def save_subscribers(subs: set):
     with open(SUBSCRIBERS_FILE, "w") as f:
         json.dump(list(subs), f)
-
 
 @tasks.loop(minutes=AUTO_UPDATE_INTERVAL_MINUTES)
 async def auto_update_loop():
     subs = load_subscribers()
     if not subs:
         return
-    print(f"Menjalankan auto-update untuk {len(subs)} channel...")
 
-    # Gantian kategori tiap kali jalan — dipilih acak dari 2 kategori yang didukung
+    print(f"Menjalankan auto-update untuk {len(subs)} channel...")
     category_key = random.choice(list(CATEGORY_INFO.keys()))
     category = CATEGORY_INFO[category_key]
 
@@ -979,9 +876,8 @@ async def auto_update_loop():
         print(f"Tidak ada data untuk kategori {category_key}, skip update kali ini.")
         return
 
-    # Ambil 1 proyek acak dari hasil, biar variatif tiap kali jalan
     chosen = random.choice(items[:10])
-    view = AlphaView([chosen])  # tetap bisa pakai tombol "Detail Lengkap"
+    view = AlphaView([chosen])
 
     for channel_id in subs:
         try:
@@ -990,6 +886,5 @@ async def auto_update_loop():
             await channel.send(embed=view.build_embed(), view=view)
         except Exception as e:
             print(f"Gagal kirim ke channel {channel_id}: {e}")
-
 
 bot.run(DISCORD_TOKEN)
